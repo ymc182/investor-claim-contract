@@ -129,10 +129,16 @@ class InvestorVesting {
       throw new Error('investors array required');
     }
 
+    const seenAccounts = new Set<string>();
+
     for (const entry of investors) {
       if (!entry.account_id || !entry.group_id || !entry.amount) {
         throw new Error('Each investor must include account_id, group_id, and amount');
       }
+      if (seenAccounts.has(entry.account_id)) {
+        throw new Error(`Duplicate investor entry for ${entry.account_id}`);
+      }
+      seenAccounts.add(entry.account_id);
       const group = this.groups.get(entry.group_id);
       if (!group) {
         throw new Error(`Unknown group_id ${entry.group_id}`);

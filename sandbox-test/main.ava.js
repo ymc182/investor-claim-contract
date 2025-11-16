@@ -133,6 +133,36 @@ test('investor cannot claim before cliff, owner can configure groups', async (t)
   t.is(state.total_deposited, (5n * ONE_TOKEN).toString());
 });
 
+test('upsert_investors rejects duplicate accounts in the same batch', async (t) => {
+  const { worker, accounts } = t.context;
+  const { root, ft, contract } = accounts;
+
+  const now = await currentTimestamp(worker);
+  await root.call(contract, 'init', {
+    owner: root.accountId,
+    token_account_id: ft.accountId,
+    tge_timestamp_ns: now.toString(),
+    groups: [
+      {
+        id: 'seed',
+        cliff_duration_ns: (6n * MONTH).toString(),
+        vesting_duration_ns: (12n * MONTH).toString(),
+      },
+    ],
+  });
+
+  await t.throwsAsync(
+    () =>
+      root.call(contract, 'upsert_investors', {
+        investors: [
+          { account_id: 'dup.test.near', group_id: 'seed', amount: (10n * ONE_TOKEN).toString() },
+          { account_id: 'dup.test.near', group_id: 'seed', amount: (5n * ONE_TOKEN).toString() },
+        ],
+      }),
+    { message: /duplicate investor entry/i },
+  );
+});
+
 test('investor claims linearly after cliff, pool accounting adjusts', async (t) => {
   const { worker, accounts } = t.context;
   const { root, ft, contract } = accounts;
