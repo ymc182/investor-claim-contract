@@ -4,7 +4,7 @@
   "license": "(MIT AND Apache-2.0)",
   "type": "module",
   "scripts": {
-    "build": "near-sdk-js build src/contract.ts build/investor_vesting.wasm && near-sdk-js build src/mock_ft.ts build/mock_ft.wasm",
+    "build": "near-sdk-js build src/investor_claim_contract.ts build/investor_vesting.wasm && near-sdk-js build src/mock_ft.ts build/mock_ft.wasm",
     "test": "$npm_execpath run build && ava -- ./build/investor_vesting.wasm"
   },
   "dependencies": {

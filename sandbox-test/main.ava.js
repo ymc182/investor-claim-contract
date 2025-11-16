@@ -11,7 +11,7 @@ setDefaultResultOrder('ipv4first');
 const test = anyTest;
 
 const ONE_YOCTO = '1';
-const ONE_TOKEN = BigInt('1000000000000000000000000');
+const ONE_TOKEN = BigInt('1000000000000000000');
 const FT_WASM_PATH = './build/mock_ft.wasm';
 const MONTH = 30n * 24n * 60n * 60n * 1_000_000_000n;
 
@@ -34,7 +34,7 @@ test.beforeEach(async (t) => {
     total_supply: (ONE_TOKEN * 1_000_000n).toString(),
     name: 'Test Token',
     symbol: 'TEST',
-    decimals: 24,
+    decimals: 18,
   });
 
   const contract = await root.createSubAccount('vesting');
@@ -222,6 +222,220 @@ test('investor claims linearly after cliff, pool accounting adjusts', async (t) 
     await contract.view('get_claimable', { account_id: alice.accountId }),
   );
   t.true(remainingClaimable <= allocation / 10000n);
+});
+
+test('investor receives instant unlock percentage after cliff', async (t) => {
+  const { worker, accounts } = t.context;
+  const { root, ft, contract } = accounts;
+
+  const now = await currentTimestamp(worker);
+  const cliff = 6n * MONTH;
+  const vesting = 24n * MONTH;
+  const initialUnlockBps = 1000n; // 10%
+  const tge = now - cliff;
+
+  await root.call(contract, 'init', {
+    owner: root.accountId,
+    token_account_id: ft.accountId,
+    tge_timestamp_ns: tge.toString(),
+    groups: [
+      {
+        id: 'saft',
+        cliff_duration_ns: cliff.toString(),
+        vesting_duration_ns: vesting.toString(),
+        initial_unlock_basis_points: initialUnlockBps.toString(),
+      },
+    ],
+  });
+
+  const carol = await root.createSubAccount('carol');
+  await root.call(
+    ft,
+    'storage_deposit',
+    { account_id: carol.accountId },
+    { attachedDeposit: '1000000000000000000000' },
+  );
+
+  const allocation = 50n * ONE_TOKEN;
+  await root.call(contract, 'upsert_investors', {
+    investors: [
+      {
+        account_id: carol.accountId,
+        group_id: 'saft',
+        amount: allocation.toString(),
+      },
+    ],
+  });
+
+  await root.call(
+    ft,
+    'ft_transfer_call',
+    {
+      receiver_id: contract.accountId,
+      amount: allocation.toString(),
+      memo: 'saft funding',
+      msg: '',
+    },
+    { attachedDeposit: ONE_YOCTO, gas: '150000000000000' },
+  );
+
+  const claimable = BigInt(await contract.view('get_claimable', { account_id: carol.accountId }));
+  const expectedInstant = (allocation * initialUnlockBps) / 10000n;
+  t.true(claimable >= expectedInstant);
+  const extra = claimable - expectedInstant;
+  t.true(extra <= allocation / 1000n); // small linear accrual since vesting just started
+
+  await carol.call(contract, 'claim', {}, { gas: '150000000000000', attachedDeposit: ONE_YOCTO });
+  const balance = await ft.view('ft_balance_of', { account_id: carol.accountId });
+  t.true(BigInt(balance) >= expectedInstant);
+
+  const investor = await contract.view('get_investor', { account_id: carol.accountId });
+  t.true(BigInt(investor.claimed) >= expectedInstant);
+});
+
+test('initial claim gated by global start date', async (t) => {
+  const { worker, accounts } = t.context;
+  const { root, ft, contract } = accounts;
+
+  const now = await currentTimestamp(worker);
+  const cliff = 12n * MONTH;
+  const vesting = 24n * MONTH;
+  const initialBasis = 500n; // 5%
+  const initialStart = now + MONTH;
+
+  await root.call(contract, 'init', {
+    owner: root.accountId,
+    token_account_id: ft.accountId,
+    tge_timestamp_ns: now.toString(),
+    groups: [
+      {
+        id: 'round-a',
+        cliff_duration_ns: cliff.toString(),
+        vesting_duration_ns: vesting.toString(),
+        initial_unlock_basis_points: '1000',
+      },
+    ],
+    initial_claim_basis_points: initialBasis.toString(),
+    initial_claim_available_timestamp_ns: initialStart.toString(),
+  });
+
+  const dave = await root.createSubAccount('dave');
+  await root.call(
+    ft,
+    'storage_deposit',
+    { account_id: dave.accountId },
+    { attachedDeposit: '1000000000000000000000' },
+  );
+
+  const allocation = 20n * ONE_TOKEN;
+  await root.call(contract, 'upsert_investors', {
+    investors: [
+      {
+        account_id: dave.accountId,
+        group_id: 'round-a',
+        amount: allocation.toString(),
+      },
+    ],
+  });
+
+  await root.call(
+    ft,
+    'ft_transfer_call',
+    {
+      receiver_id: contract.accountId,
+      amount: allocation.toString(),
+      memo: 'round a funding',
+      msg: '',
+    },
+    { attachedDeposit: ONE_YOCTO, gas: '150000000000000' },
+  );
+
+  const beforeStart = await contract.view('get_claimable', { account_id: dave.accountId });
+  t.is(beforeStart, '0');
+
+  await t.throwsAsync(
+    () =>
+      dave.call(contract, 'claim', {}, { gas: '150000000000000', attachedDeposit: ONE_YOCTO }),
+    { message: /nothing to claim/i },
+  );
+
+  await root.call(contract, 'configure_initial_claim', {
+    initial_claim_available_timestamp_ns: (now - MONTH).toString(),
+  });
+
+  const claimable = BigInt(await contract.view('get_claimable', { account_id: dave.accountId }));
+  const expectedInitial = (allocation * initialBasis) / 10000n;
+  t.true(claimable >= expectedInitial);
+  t.true(claimable - expectedInitial <= allocation / 1000n);
+
+  await dave.call(contract, 'claim', {}, { gas: '150000000000000', attachedDeposit: ONE_YOCTO });
+  const daveBalance = BigInt(await ft.view('ft_balance_of', { account_id: dave.accountId }));
+  t.true(daveBalance >= expectedInitial);
+});
+
+test('initial claim at 0% behaves like disabled', async (t) => {
+  const { worker, accounts } = t.context;
+  const { root, ft, contract } = accounts;
+
+  const now = await currentTimestamp(worker);
+  const cliff = 6n * MONTH;
+  const vesting = 18n * MONTH;
+
+  await root.call(contract, 'init', {
+    owner: root.accountId,
+    token_account_id: ft.accountId,
+    tge_timestamp_ns: now.toString(),
+    groups: [
+      {
+        id: 'round-b',
+        cliff_duration_ns: cliff.toString(),
+        vesting_duration_ns: vesting.toString(),
+        initial_unlock_basis_points: '0',
+      },
+    ],
+    initial_claim_basis_points: '0',
+    initial_claim_available_timestamp_ns: now.toString(),
+  });
+
+  const erin = await root.createSubAccount('erin');
+  await root.call(
+    ft,
+    'storage_deposit',
+    { account_id: erin.accountId },
+    { attachedDeposit: '1000000000000000000000' },
+  );
+
+  const allocation = 30n * ONE_TOKEN;
+  await root.call(contract, 'upsert_investors', {
+    investors: [
+      {
+        account_id: erin.accountId,
+        group_id: 'round-b',
+        amount: allocation.toString(),
+      },
+    ],
+  });
+
+  await root.call(
+    ft,
+    'ft_transfer_call',
+    {
+      receiver_id: contract.accountId,
+      amount: allocation.toString(),
+      memo: 'round b funding',
+      msg: '',
+    },
+    { attachedDeposit: ONE_YOCTO, gas: '150000000000000' },
+  );
+
+  const initialClaimable = await contract.view('get_claimable', { account_id: erin.accountId });
+  t.is(initialClaimable, '0');
+
+  await t.throwsAsync(
+    () =>
+      erin.call(contract, 'claim', {}, { gas: '150000000000000', attachedDeposit: ONE_YOCTO }),
+    { message: /nothing to claim/i },
+  );
 });
 
 test('owner can adjust investor allocation upwards and withdraw surplus', async (t) => {

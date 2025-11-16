@@ -1,19 +1,22 @@
-import { NearBindgen, near, call, view, initialize, NearPromise } from 'near-sdk-js';
+import { NearBindgen, near, call, view, initialize, NearPromise, UnorderedMap } from 'near-sdk-js';
 
 const ONE_YOCTO = BigInt(1);
 const NO_DEPOSIT = BigInt(0);
 const GAS_FOR_FT_TRANSFER = BigInt('50000000000000'); // 50 Tgas
 const GAS_FOR_RESOLVE = BigInt('20000000000000'); // 20 Tgas
+const BASIS_POINTS_DENOMINATOR = BigInt(10_000);
 
 type GroupConfigInput = {
   id: string;
   cliff_duration_ns: string;
   vesting_duration_ns: string;
+  initial_unlock_basis_points?: string;
 };
 
 type GroupConfigStored = {
   cliffDurationNs: string;
   vestingDurationNs: string;
+  initialUnlockBasisPoints: string;
 };
 
 type InvestorInput = {
@@ -44,17 +47,25 @@ type FtOnTransferArgs = {
   msg: string;
 };
 
+type InitialClaimConfigInput = {
+  initial_claim_basis_points?: string;
+  initial_claim_available_timestamp_ns?: string;
+};
+
+
 @NearBindgen({ requireInit: true })
 class InvestorVesting {
   owner: string = '';
   tokenAccountId: string = '';
   tgeTimestampNs: string = '0';
+  initialClaimBasisPoints: string = '0';
+  initialClaimAvailableTimestampNs: string = '0';
   totalDeposited: string = '0';
   totalClaimed: string = '0';
   totalWithdrawn: string = '0';
   poolBalance: string = '0';
-  groups: Record<string, GroupConfigStored> = {};
-  investors: Record<string, InvestorRecord> = {};
+  groups: UnorderedMap<GroupConfigStored> = new UnorderedMap<GroupConfigStored>('groups:');
+  investors: UnorderedMap<InvestorRecord> = new UnorderedMap<InvestorRecord>('investors:');
 
   @initialize({})
   init({
@@ -62,11 +73,15 @@ class InvestorVesting {
     token_account_id,
     tge_timestamp_ns,
     groups,
+    initial_claim_basis_points,
+    initial_claim_available_timestamp_ns,
   }: {
     owner?: string;
     token_account_id: string;
     tge_timestamp_ns: string;
     groups: GroupConfigInput[];
+    initial_claim_basis_points?: string;
+    initial_claim_available_timestamp_ns?: string;
   }): void {
     if (this.owner !== '') {
       throw new Error('Contract already initialized');
@@ -84,6 +99,11 @@ class InvestorVesting {
     this.owner = owner ?? near.predecessorAccountId();
     this.tokenAccountId = token_account_id;
     this.tgeTimestampNs = tge_timestamp_ns;
+    this.setInitialClaimConfig({
+      initial_claim_basis_points,
+      initial_claim_available_timestamp_ns:
+        initial_claim_available_timestamp_ns ?? tge_timestamp_ns,
+    });
     this.setGroupsInternal(groups);
   }
 
@@ -91,6 +111,12 @@ class InvestorVesting {
   configure_groups({ groups }: { groups: GroupConfigInput[] }): void {
     this.assertOwner();
     this.setGroupsInternal(groups);
+  }
+
+  @call({})
+  configure_initial_claim(args: InitialClaimConfigInput): void {
+    this.assertOwner();
+    this.setInitialClaimConfig(args);
   }
 
   @call({})
@@ -104,7 +130,7 @@ class InvestorVesting {
       if (!entry.account_id || !entry.group_id || !entry.amount) {
         throw new Error('Each investor must include account_id, group_id, and amount');
       }
-      const group = this.groups[entry.group_id];
+      const group = this.groups.get(entry.group_id);
       if (!group) {
         throw new Error(`Unknown group_id ${entry.group_id}`);
       }
@@ -113,23 +139,23 @@ class InvestorVesting {
         throw new Error('Investor amount must be positive');
       }
 
-      const current = this.investors[entry.account_id];
+      const current = this.investors.get(entry.account_id);
       if (current) {
         const alreadyClaimed = BigInt(current.claimed);
         if (amount < alreadyClaimed) {
           throw new Error(`New allocation for ${entry.account_id} cannot be less than claimed amount`);
         }
-        this.investors[entry.account_id] = {
+        this.investors.set(entry.account_id, {
           groupId: entry.group_id,
           totalAllocation: amount.toString(),
           claimed: alreadyClaimed.toString(),
-        };
+        });
       } else {
-        this.investors[entry.account_id] = {
+        this.investors.set(entry.account_id, {
           groupId: entry.group_id,
           totalAllocation: amount.toString(),
           claimed: '0',
-        };
+        });
       }
     }
   }
@@ -143,7 +169,7 @@ class InvestorVesting {
       throw new Error('Only owner can claim on behalf of investors');
     }
 
-    const record = this.investors[claimant];
+    const record = this.investors.get(claimant);
     if (!record) {
       throw new Error('No allocation found for this account');
     }
@@ -157,10 +183,10 @@ class InvestorVesting {
       throw new Error('Insufficient available pool balance; try again later');
     }
 
-    this.investors[claimant] = {
+    this.investors.set(claimant, {
       ...record,
       claimed: (BigInt(record.claimed) + claimable).toString(),
-    };
+    });
     this.totalClaimed = (BigInt(this.totalClaimed) + claimable).toString();
     this.poolBalance = (BigInt(this.poolBalance) - claimable).toString();
 
@@ -259,15 +285,15 @@ class InvestorVesting {
     try {
       near.promiseResult(0);
     } catch (error) {
-      const record = this.investors[account_id];
+      const record = this.investors.get(account_id);
       if (!record) {
         throw new Error('Investor record missing during claim revert');
       }
       const tokenAmount = BigInt(amount);
-      this.investors[account_id] = {
+      this.investors.set(account_id, {
         ...record,
         claimed: (BigInt(record.claimed) - tokenAmount).toString(),
-      };
+      });
       this.totalClaimed = (BigInt(this.totalClaimed) - tokenAmount).toString();
       this.poolBalance = (BigInt(this.poolBalance) + tokenAmount).toString();
       near.log(`Token transfer failed for ${account_id}, reverting claim`);
@@ -296,6 +322,8 @@ class InvestorVesting {
     owner: string;
     token_account_id: string;
     tge_timestamp_ns: string;
+    initial_claim_basis_points: string;
+    initial_claim_available_timestamp_ns: string;
     total_deposited: string;
     total_claimed: string;
     total_withdrawn: string;
@@ -306,11 +334,13 @@ class InvestorVesting {
       owner: this.owner,
       token_account_id: this.tokenAccountId,
       tge_timestamp_ns: this.tgeTimestampNs,
+      initial_claim_basis_points: this.initialClaimBasisPoints,
+      initial_claim_available_timestamp_ns: this.initialClaimAvailableTimestampNs,
       total_deposited: this.totalDeposited,
       total_claimed: this.totalClaimed,
       total_withdrawn: this.totalWithdrawn,
       pool_balance: this.poolBalance,
-      groups: this.groups,
+      groups: this.serializeGroups(),
     };
   }
 
@@ -319,7 +349,7 @@ class InvestorVesting {
     if (!account_id) {
       throw new Error('account_id is required');
     }
-    return this.investors[account_id] ?? null;
+    return this.investors.get(account_id);
   }
 
   @view({})
@@ -331,11 +361,11 @@ class InvestorVesting {
   }
 
   private computeClaimable(accountId: string, timestamp: bigint): bigint {
-    const record = this.investors[accountId];
+    const record = this.investors.get(accountId);
     if (!record) {
       return BigInt(0);
     }
-    const group = this.groups[record.groupId];
+    const group = this.groups.get(record.groupId);
     if (!group) {
       return BigInt(0);
     }
@@ -361,46 +391,103 @@ class InvestorVesting {
     const start = BigInt(this.tgeTimestampNs);
     const cliff = BigInt(group.cliffDurationNs);
     const vesting = BigInt(group.vestingDurationNs);
+    const initialClaimStart = BigInt(this.initialClaimAvailableTimestampNs);
+    const initialClaimBps = BigInt(this.initialClaimBasisPoints ?? '0');
+    const postCliffBps = BigInt(group.initialUnlockBasisPoints ?? '0');
+
+    const initialPortionRaw = (total * initialClaimBps) / BASIS_POINTS_DENOMINATOR;
+    const initialPortion = initialPortionRaw > total ? total : initialPortionRaw;
+    const remainingAfterInitial = total - initialPortion;
+    const postCliffPortionRaw = (total * postCliffBps) / BASIS_POINTS_DENOMINATOR;
+    const postCliffPortion =
+      postCliffPortionRaw > remainingAfterInitial ? remainingAfterInitial : postCliffPortionRaw;
+    const linearPortionBase = total - initialPortion - postCliffPortion;
+
+    let vested = BigInt(0);
+    if (timestamp >= initialClaimStart) {
+      vested += initialPortion;
+    }
 
     if (timestamp < start + cliff) {
-      return BigInt(0);
+      return vested > total ? total : vested;
     }
 
     if (vesting === BigInt(0)) {
       return total;
     }
 
+    vested += postCliffPortion;
     const elapsed = timestamp - (start + cliff);
     if (elapsed >= vesting) {
       return total;
     }
 
-    return (total * elapsed) / vesting;
+    const linearVested = (linearPortionBase * elapsed) / vesting;
+    vested += linearVested;
+    return vested > total ? total : vested;
   }
 
   private setGroupsInternal(groups: GroupConfigInput[]): void {
     if (!Array.isArray(groups) || groups.length === 0) {
       throw new Error('groups must be a non-empty array');
     }
-    const next: Record<string, GroupConfigStored> = {};
+    const seen = new Set<string>();
+    this.groups.clear();
     for (const group of groups) {
       if (!group.id) {
         throw new Error('group id is required');
       }
-      if (next[group.id]) {
+      if (seen.has(group.id)) {
         throw new Error(`Duplicate group id ${group.id}`);
       }
+      seen.add(group.id);
       const cliff = BigInt(group.cliff_duration_ns);
       const vesting = BigInt(group.vesting_duration_ns);
+      const initialUnlockRaw = group.initial_unlock_basis_points ?? '0';
+      const initialUnlockBps = BigInt(initialUnlockRaw);
       if (cliff < BigInt(0) || vesting < BigInt(0)) {
         throw new Error('Durations must be non-negative');
       }
-      next[group.id] = {
+      if (initialUnlockBps < BigInt(0)) {
+        throw new Error('initial_unlock_basis_points must be non-negative');
+      }
+      if (initialUnlockBps > BASIS_POINTS_DENOMINATOR) {
+        throw new Error('initial_unlock_basis_points cannot exceed 100%');
+      }
+      this.groups.set(group.id, {
         cliffDurationNs: cliff.toString(),
         vestingDurationNs: vesting.toString(),
-      };
+        initialUnlockBasisPoints: initialUnlockBps.toString(),
+      });
     }
-    this.groups = next;
+  }
+
+  private serializeGroups(): Record<string, GroupConfigStored> {
+    const snapshot: Record<string, GroupConfigStored> = {};
+    for (const [id, config] of this.groups.toArray()) {
+      snapshot[id] = config;
+    }
+    return snapshot;
+  }
+
+  private setInitialClaimConfig({
+    initial_claim_basis_points,
+    initial_claim_available_timestamp_ns,
+  }: InitialClaimConfigInput = {}): void {
+    const basisRaw = initial_claim_basis_points ?? this.initialClaimBasisPoints ?? '0';
+    const basis = BigInt(basisRaw);
+    if (basis < BigInt(0) || basis > BASIS_POINTS_DENOMINATOR) {
+      throw new Error('initial_claim_basis_points must be between 0 and 10000');
+    }
+    this.initialClaimBasisPoints = basis.toString();
+
+    const timestampRaw =
+      initial_claim_available_timestamp_ns ?? this.initialClaimAvailableTimestampNs ?? '0';
+    const timestamp = BigInt(timestampRaw);
+    if (timestamp < BigInt(0)) {
+      throw new Error('initial_claim_available_timestamp_ns must be non-negative');
+    }
+    this.initialClaimAvailableTimestampNs = timestamp.toString();
   }
 
   private assertOwner(): void {

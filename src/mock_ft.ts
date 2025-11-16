@@ -38,7 +38,7 @@ class MockFungibleToken {
     icon: null,
     reference: null,
     reference_hash: null,
-    decimals: 24,
+    decimals: 18,
   };
 
   @initialize({})
