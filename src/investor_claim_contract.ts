@@ -92,17 +92,13 @@ class InvestorVesting {
     if (!tge_timestamp_ns) {
       throw new Error('tge_timestamp_ns is required');
     }
-    if (!Array.isArray(groups) || groups.length === 0) {
-      throw new Error('At least one group configuration is required');
-    }
 
     this.owner = owner ?? near.predecessorAccountId();
     this.tokenAccountId = token_account_id;
     this.tgeTimestampNs = tge_timestamp_ns;
     this.setInitialClaimConfig({
       initial_claim_basis_points,
-      initial_claim_available_timestamp_ns:
-        initial_claim_available_timestamp_ns ?? tge_timestamp_ns,
+      initial_claim_available_timestamp_ns,
     });
     this.setGroupsInternal(groups);
   }
@@ -116,6 +112,13 @@ class InvestorVesting {
   @call({})
   configure_initial_claim(args: InitialClaimConfigInput): void {
     this.assertOwner();
+    if (
+      !args ||
+      (args.initial_claim_basis_points === undefined &&
+        args.initial_claim_available_timestamp_ns === undefined)
+    ) {
+      throw new Error('At least one initial claim parameter must be provided');
+    }
     this.setInitialClaimConfig(args);
   }
 
@@ -474,18 +477,26 @@ class InvestorVesting {
     initial_claim_basis_points,
     initial_claim_available_timestamp_ns,
   }: InitialClaimConfigInput = {}): void {
-    const basisRaw = initial_claim_basis_points ?? this.initialClaimBasisPoints ?? '0';
+    const basisSource = initial_claim_basis_points ?? this.initialClaimBasisPoints ?? '0';
+    const basisRaw = basisSource === '' ? '0' : basisSource;
     const basis = BigInt(basisRaw);
     if (basis < BigInt(0) || basis > BASIS_POINTS_DENOMINATOR) {
       throw new Error('initial_claim_basis_points must be between 0 and 10000');
     }
     this.initialClaimBasisPoints = basis.toString();
 
-    const timestampRaw =
-      initial_claim_available_timestamp_ns ?? this.initialClaimAvailableTimestampNs ?? '0';
+    const timestampSource =
+      initial_claim_available_timestamp_ns ??
+      this.initialClaimAvailableTimestampNs ??
+      this.tgeTimestampNs ??
+      '0';
+    const timestampRaw = timestampSource === '' ? '0' : timestampSource;
     const timestamp = BigInt(timestampRaw);
     if (timestamp < BigInt(0)) {
       throw new Error('initial_claim_available_timestamp_ns must be non-negative');
+    }
+    if (basis > BigInt(0) && timestamp === BigInt(0)) {
+      throw new Error('initial_claim_available_timestamp_ns must be provided when basis > 0');
     }
     this.initialClaimAvailableTimestampNs = timestamp.toString();
   }

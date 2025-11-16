@@ -438,6 +438,41 @@ test('initial claim at 0% behaves like disabled', async (t) => {
   );
 });
 
+test('configure_initial_claim validates input arguments', async (t) => {
+  const { worker, accounts } = t.context;
+  const { root, ft, contract } = accounts;
+
+  const now = await currentTimestamp(worker);
+  const cliff = 6n * MONTH;
+
+  await root.call(contract, 'init', {
+    owner: root.accountId,
+    token_account_id: ft.accountId,
+    tge_timestamp_ns: now.toString(),
+    groups: [
+      {
+        id: 'public',
+        cliff_duration_ns: cliff.toString(),
+        vesting_duration_ns: cliff.toString(),
+      },
+    ],
+  });
+
+  await t.throwsAsync(
+    () => root.call(contract, 'configure_initial_claim', {}),
+    { message: /at least one initial claim parameter/i },
+  );
+
+  await t.throwsAsync(
+    () =>
+      root.call(contract, 'configure_initial_claim', {
+        initial_claim_basis_points: '100',
+        initial_claim_available_timestamp_ns: '0',
+      }),
+    { message: /must be provided when basis > 0/i },
+  );
+});
+
 test('owner can adjust investor allocation upwards and withdraw surplus', async (t) => {
   const { worker, accounts } = t.context;
   const { root, ft, contract } = accounts;
